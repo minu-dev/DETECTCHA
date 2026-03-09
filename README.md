@@ -1,2 +1,2 @@
-# S.O.S
-Development of a Privacy-Preserving Financial Fraud Prevention Edge Computing Solution Using On-Device AI
+# DETECTCHA
+Privacy-Preserving Edge AI for Financial Fraud Prevention
