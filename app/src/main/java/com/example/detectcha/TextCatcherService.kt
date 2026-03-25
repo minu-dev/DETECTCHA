@@ -15,6 +15,8 @@ class TextCatcherService : AccessibilityService() {
     private val printedSentences = mutableSetOf<String>()
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
+        if (!CatcherController.isCatching) return
+
         if (event == null) return
 
         val packageName = event.packageName?.toString() ?: return
@@ -46,9 +48,9 @@ class TextCatcherService : AccessibilityService() {
 
             if (cleanText.isNotEmpty()) {
                 // 2차 문장 전처리 로직
-                // .이나 ?나 ! 뒤에 공백이 오고, 그 다음 글자가 대문자인 곳을 기준으로 자름
+                // .이나 ?나 ! 뒤에 공백이 오고, 그 다음 글자가 대문자 혹은 숫자인 곳을 기준으로 자름
                 // lookahead/lookbehind를 사용해서 구분자 자체는 날아가지 않게 함
-                val regex = "(?<=[.!?])\\s+(?=[A-Z])".toRegex()
+                val regex = "(?<=[.!?])\\s+(?=[A-Z0-9])".toRegex()
                 val chunks = cleanText.split(regex)
                 // 파싱한 조각 검사
                 for (i in chunks.indices) {
@@ -79,4 +81,8 @@ class TextCatcherService : AccessibilityService() {
         super.onServiceConnected()
         Log.d(TAG, "[Text Catcher Connected]")
     }
+}
+
+object CatcherController {
+    var isCatching = false
 }
