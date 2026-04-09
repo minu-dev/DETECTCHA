@@ -1,11 +1,22 @@
 package com.example.detectcha
 
+import android.Manifest
+import android.app.AppOpsManager
+import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
+import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
+import android.view.TextureView
+import android.view.View
+import android.view.accessibility.AccessibilityManager
+import android.widget.FrameLayout
 import android.widget.Toast
+import android.graphics.Paint
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.annotation.OptIn
 import androidx.compose.animation.Crossfade
 import androidx.compose.animation.core.*
@@ -20,39 +31,62 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
-import androidx.core.app.NotificationManagerCompat
+import androidx.core.content.ContextCompat
+import androidx.core.graphics.BlendModeCompat
+import androidx.core.graphics.PaintCompat
 import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.ExoPlayer
-import androidx.core.graphics.BlendModeCompat
-import androidx.core.graphics.PaintCompat
-import android.view.TextureView
-import android.widget.FrameLayout
-import android.view.View
-import android.graphics.Paint
-import android.content.Context
-import android.view.accessibility.AccessibilityManager
 
 class MainActivity : ComponentActivity() {
+    private val requestNotificationPermissionLauncher =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { isGranted: Boolean ->
+            if (!isGranted) {
+                Toast.makeText(this, "알림 권한이 없으면 경고를 받을 수 없습니다.", Toast.LENGTH_LONG).show()
+            }
+            // 💡 [핵심] 알림 권한 처리가 끝난 직후에 사용 정보 권한을 체크하도록 변경!
+            checkAndRequestUsageStatsPermission()
+        }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        if (!isNotificationPermissionGranted()) {
-            Toast.makeText(this, "알림 접근 권한을 허용해주세요.", Toast.LENGTH_LONG).show()
-            val intent = Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS)
-            startActivity(intent)
-        }
+        // 2. 앱 실행 시 권한 흐름 제어
+        startPermissionCheckFlow()
 
         setContent {
             DetectchaApp()
         }
     }
 
-    private fun isNotificationPermissionGranted(): Boolean {
-        val packageName = packageName
-        val sets = NotificationManagerCompat.getEnabledListenerPackages(this)
-        return sets.contains(packageName)
+    private fun startPermissionCheckFlow() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+                // 알림 권한이 없으면 팝업부터 띄움 (팝업이 닫히면 launcher 안에서 사용정보 권한을 부름)
+                requestNotificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+            } else {
+                // 이미 알림 권한이 있다면 바로 사용 정보 권한 체크
+                checkAndRequestUsageStatsPermission()
+            }
+        } else {
+            // 안드로이드 13 미만은 알림 팝업이 필요 없으므로 바로 사용 정보 권한 체크
+            checkAndRequestUsageStatsPermission()
+        }
+    }
+
+    private fun checkAndRequestUsageStatsPermission() {
+        val appOps = getSystemService(Context.APP_OPS_SERVICE) as AppOpsManager
+        val mode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            appOps.unsafeCheckOpNoThrow(AppOpsManager.OPSTR_GET_USAGE_STATS, android.os.Process.myUid(), packageName)
+        } else {
+            appOps.checkOpNoThrow(AppOpsManager.OPSTR_GET_USAGE_STATS, android.os.Process.myUid(), packageName)
+        }
+
+        if (mode != AppOpsManager.MODE_ALLOWED) {
+            Toast.makeText(this, "송금 앱 감지를 위해 '사용 정보 접근' 권한을 허용해 주세요.", Toast.LENGTH_LONG).show()
+            startActivity(Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS))
+        }
     }
 }
 
@@ -170,22 +204,36 @@ fun DetectchaApp() {
                     .width(180.dp)
                     .height(45.dp)
                     .clickable {
-                        val am = context.getSystemService(Context.ACCESSIBILITY_SERVICE) as AccessibilityManager
-                        val enabledServices = Settings.Secure.getString(
-                            context.contentResolver,
-                            Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES
-                        )
-                        val isServiceEnabled = enabledServices?.contains(context.packageName) == true
+                    val am = context.getSystemService(Context.ACCESSIBILITY_SERVICE) as AccessibilityManager
+                    val enabledServices = Settings.Secure.getString(
+                        context.contentResolver,
+                        Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES
+                    )
+                    val isServiceEnabled = enabledServices?.contains(context.packageName) == true
 
-                        if (!isServiceEnabled) {
-                            Toast.makeText(context, "접근성 권한을 먼저 허용해주세요!", Toast.LENGTH_LONG).show()
-                            val intent = Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)
-                            context.startActivity(intent)
+                    if (!isServiceEnabled) {
+                        Toast.makeText(context, "접근성 권한을 먼저 허용해주세요!", Toast.LENGTH_LONG).show()
+                        val intent = Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)
+                        context.startActivity(intent)
+                    } else {
+                        isActivated = !isActivated
+                        CatcherController.isCatching = isActivated
+
+                        // 💡 [추가] 버튼 클릭 시 서비스에 명령 전달
+                        val serviceIntent = Intent(context, TextCatcherService::class.java)
+                        if (isActivated) {
+                            // 버튼 ON: 서비스 시작 및 알림 띄우기 명령
+                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                                context.startForegroundService(serviceIntent)
+                            } else {
+                                context.startService(serviceIntent)
+                            }
                         } else {
-                            isActivated = !isActivated
-                            CatcherController.isCatching = isActivated
+                            // 버튼 OFF: 포그라운드 알림 제거 및 중단 명령 (필요 시)
+                            context.stopService(serviceIntent)
                         }
-                    },
+                    }
+                },
                 contentAlignment = Alignment.Center
             ) {
                 Crossfade(targetState = isActivated, animationSpec = tween(300)) { activated ->
