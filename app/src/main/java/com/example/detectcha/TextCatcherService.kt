@@ -214,9 +214,9 @@ class TextCatcherService : AccessibilityService() {
                     val label = result.label
                     if (probability >= 0.5f) {
                         isFraudSuspected = true
-                        Log.e(TAG, "🚨 [의심 감지] 유형: $label (${String.format(Locale.US, "%.2f", probability * 100)}%) | 텍스트: $text")
+                        Log.e(TAG, "[의심 감지] 유형: $label (${String.format(Locale.US, "%.2f", probability * 100)}%) | 텍스트: $text")
                     } else {
-                        Log.d(TAG, "✅ [정상 대화] 결과: $label | 텍스트: $text")
+                        Log.d(TAG, "[정상 대화] 결과: $label | 텍스트: $text")
                     }
                 }
             } catch (e: Exception) {
