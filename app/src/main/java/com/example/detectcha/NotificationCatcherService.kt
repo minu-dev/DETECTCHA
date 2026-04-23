@@ -42,6 +42,6 @@ class NotificationCatcherService : NotificationListenerService() {
         val currentMsg = "$title|$text"
         if (currentMsg == lastProcessedText) return
         lastProcessedText = currentMsg
-        Log.d("NotificationCatcher", "[Notification] Package: $packageName | Title: $title | Content: $text")
+        Log.d("NotificationCatcher", "[알림] 패키지: $packageName | 타이틀: $title | 내용: $text")
     }
 }

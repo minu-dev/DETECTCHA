@@ -45,14 +45,12 @@ class MainActivity : ComponentActivity() {
             if (!isGranted) {
                 Toast.makeText(this, "알림 권한이 없으면 경고를 받을 수 없습니다.", Toast.LENGTH_LONG).show()
             }
-            // 💡 [핵심] 알림 권한 처리가 끝난 직후에 사용 정보 권한을 체크하도록 변경!
             checkAndRequestUsageStatsPermission()
         }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // 2. 앱 실행 시 권한 흐름 제어
         startPermissionCheckFlow()
 
         setContent {
@@ -63,14 +61,11 @@ class MainActivity : ComponentActivity() {
     private fun startPermissionCheckFlow() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
-                // 알림 권한이 없으면 팝업부터 띄움 (팝업이 닫히면 launcher 안에서 사용정보 권한을 부름)
                 requestNotificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
             } else {
-                // 이미 알림 권한이 있다면 바로 사용 정보 권한 체크
                 checkAndRequestUsageStatsPermission()
             }
         } else {
-            // 안드로이드 13 미만은 알림 팝업이 필요 없으므로 바로 사용 정보 권한 체크
             checkAndRequestUsageStatsPermission()
         }
     }
@@ -84,7 +79,7 @@ class MainActivity : ComponentActivity() {
         }
 
         if (mode != AppOpsManager.MODE_ALLOWED) {
-            Toast.makeText(this, "송금 앱 감지를 위해 '사용 정보 접근' 권한을 허용해 주세요.", Toast.LENGTH_LONG).show()
+            Toast.makeText(this, "사용 정보 접근 권한을 허용해 주세요.", Toast.LENGTH_LONG).show()
             startActivity(Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS))
         }
     }
@@ -219,17 +214,14 @@ fun DetectchaApp() {
                         isActivated = !isActivated
                         CatcherController.isCatching = isActivated
 
-                        // 💡 [추가] 버튼 클릭 시 서비스에 명령 전달
                         val serviceIntent = Intent(context, TextCatcherService::class.java)
                         if (isActivated) {
-                            // 버튼 ON: 서비스 시작 및 알림 띄우기 명령
                             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                                 context.startForegroundService(serviceIntent)
                             } else {
                                 context.startService(serviceIntent)
                             }
                         } else {
-                            // 버튼 OFF: 포그라운드 알림 제거 및 중단 명령 (필요 시)
                             context.stopService(serviceIntent)
                         }
                     }
@@ -247,7 +239,6 @@ fun DetectchaApp() {
             }
         }
 
-        // [하단 로고]
         Box(
             modifier = Modifier
                 .fillMaxSize()
