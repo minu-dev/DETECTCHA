@@ -37,16 +37,18 @@ class ElectraTokenizer(context: Context) {
         try {
             val normalizedText = Normalizer.normalize(text, Normalizer.Form.NFC)
 
-            val words = normalizedText.split(Regex("\\s+")).filter { it.isNotEmpty() }
+            val words = normalizedText
+                .replace(Regex("([.,!?])"), " $1 ")
+                .split(Regex("\\s+"))
+                .filter { it.isNotEmpty() }
 
             val tokens = mutableListOf<Int>()
             tokens.add(CLS_ID)
 
             for (word in words) {
-                if (tokens.size >= MAX_LEN - 1) break
-                
                 var start = 0
                 val subTokens = mutableListOf<Int>()
+                var isBad = false
                 
                 while (start < word.length) {
                     var end = word.length
@@ -64,26 +66,32 @@ class ElectraTokenizer(context: Context) {
                     }
                     
                     if (curMatchId == -1) {
-                        subTokens.add(UNK_ID)
-                        start++
+                        isBad = true
+                        break
                     } else {
                         subTokens.add(curMatchId)
                         start = end
                     }
                 }
-                tokens.addAll(subTokens)
+
+                if (isBad) {
+                    tokens.add(UNK_ID)
+                } else {
+                    tokens.addAll(subTokens)
+                }
+                
+                if (tokens.size >= MAX_LEN - 1) break
             }
 
-            val finalTokens = if (tokens.size > MAX_LEN - 1) tokens.subList(0, MAX_LEN - 1) else tokens
-            val result = finalTokens.toMutableList()
-            result.add(SEP_ID)
+            if (tokens.size < MAX_LEN) {
+                tokens.add(SEP_ID)
+            } else {
+                tokens[MAX_LEN - 1] = SEP_ID
+            }
 
-            Log.d("ElectraTokenizer", "Text: $text")
-            Log.d("ElectraTokenizer", "Tokens: ${result.joinToString(", ")}")
-
-            for (i in result.indices) {
+            for (i in tokens.indices) {
                 if (i < MAX_LEN) {
-                    inputIds[i] = result[i]
+                    inputIds[i] = tokens[i]
                     attentionMask[i] = 1
                 }
             }

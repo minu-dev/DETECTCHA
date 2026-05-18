@@ -8,6 +8,8 @@ import java.nio.MappedByteBuffer
 import java.nio.channels.FileChannel
 import java.util.Locale
 import kotlin.math.exp
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 class PhishingModelManager(private val context: Context) {
 
@@ -17,20 +19,40 @@ class PhishingModelManager(private val context: Context) {
     private var interpreter: Interpreter? = null
     private lateinit var tokenizer: ElectraTokenizer
     
-    private var inputIdsIdx = 1
-    private var attentionMaskIdx = 0
+    private val mutex = Mutex()
+
+    private var inputIdsIdx = 0
+    private var attentionMaskIdx = 1
     private var tokenTypeIdsIdx = 2
 
     private val labelMap = mapOf(
-        0 to "경고/협박", 1 to "답변 회피", 2 to "약속", 3 to "슬픔/괴로움", 
-        4 to "명령", 5 to "사과", 6 to "기타 인사", 7 to "부름", 
-        8 to "끝인사", 9 to "칭찬", 10 to "감탄", 11 to "비난/불평", 
-        12 to "거절/부정", 13 to "감사", 14 to "선언", 15 to "첫인사", 
-        16 to "기타 표출", 17 to "제안/요청", 18 to "수용/긍정", 
-        19 to "확인 질문", 20 to "주장", 21 to "단순 질문", 22 to "단순 진술"
+        0 to "주장", 1 to "제안/요청", 2 to "첫인사", 3 to "확인 질문",
+        4 to "거절/부정", 5 to "단순 진술", 6 to "사과", 7 to "선언",
+        8 to "수용/긍정", 9 to "단순 질문", 10 to "끝인사", 11 to "감사",
+        12 to "기타 표출", 13 to "비난/불평", 14 to "약속", 15 to "기타 인사",
+        16 to "답변 회피", 17 to "감탄", 18 to "칭찬", 19 to "부름",
+        20 to "슬픔/괴로움", 21 to "경고/협박", 22 to "명령"
     )
 
-    data class AnalysisResult(val probability: Float, val label: String)
+    private val PRIMARY_RISK_LABELS = setOf("경고/협박", "답변 회피", "비난/불평")
+    private val DIRECTIVE_RISK_LABELS = setOf("명령", "제안/요청")
+
+    data class AnalysisResult(
+        val isFraudSuspected: Boolean,
+        val topLabel: String,
+        val topProbability: Float
+    )
+
+    data class DetailedAnalysisResult(
+        val text: String,
+        val fullDistribution: List<Pair<String, Float>>,
+        val top3: List<Pair<String, Float>>,
+        val primaryRiskProb: Float,
+        val directiveRiskProb: Float,
+        val signalCount: Int,
+        val patterns: Map<String, Int>,
+        val finalDecision: Boolean
+    )
 
     init {
         initModel()
@@ -43,16 +65,17 @@ class PhishingModelManager(private val context: Context) {
             val interp = Interpreter(modelBuffer, options)
             
             for (i in 0 until interp.inputTensorCount) {
-                val name = interp.getInputTensor(i).name()
+                val name = interp.getInputTensor(i).name().lowercase(Locale.ROOT)
                 when {
                     name.contains("input_ids") -> inputIdsIdx = i
                     name.contains("attention_mask") -> attentionMaskIdx = i
                     name.contains("token_type_ids") -> tokenTypeIdsIdx = i
                 }
             }
+            
             interpreter = interp
             tokenizer = ElectraTokenizer(context)
-            Log.d(TAG, "모델 및 토크나이저 초기화 완료")
+            Log.d(TAG, "모델 초기화 완료")
         } catch (e: Exception) {
             Log.e(TAG, "모델 초기화 실패: ${e.message}")
         }
@@ -67,16 +90,15 @@ class PhishingModelManager(private val context: Context) {
         return fileChannel.map(FileChannel.MapMode.READ_ONLY, startOffset, declaredLength)
     }
 
-    fun classifyText(text: String): AnalysisResult? {
+    suspend fun classifyDetailed(text: String): DetailedAnalysisResult? = mutex.withLock {
         val interp = interpreter ?: return null
 
         try {
-            val safeText = if (text.length > 200) text.take(200) else text
-            val (inputIds, attentionMask, tokenTypeIds) = tokenizer.tokenize(safeText)
+            val (inputIds, attentionMask, tokenTypeIds) = tokenizer.tokenize(text)
 
             val inputs = arrayOfNulls<Any>(3)
-            inputs[attentionMaskIdx] = arrayOf(attentionMask)
             inputs[inputIdsIdx] = arrayOf(inputIds)
+            inputs[attentionMaskIdx] = arrayOf(attentionMask)
             inputs[tokenTypeIdsIdx] = arrayOf(tokenTypeIds)
 
             val outputArray = arrayOf(FloatArray(23)) 
@@ -85,31 +107,74 @@ class PhishingModelManager(private val context: Context) {
             interp.runForMultipleInputsOutputs(inputs, outputs)
 
             val logits = outputArray[0]
-            val maxLogit = logits.maxOrNull() ?: 0f
-            val exps = logits.map { exp((it - maxLogit).toDouble()) }
-            val sumExps = exps.sum()
-            val probs = exps.map { (it / sumExps).toFloat() }
-
-            val fullDistribution = probs.withIndex().joinToString(separator = ", ") {
-                "${it.index}(${String.format("%.1f", it.value * 100)}%)" 
+            val probs = softmax(logits)
+            val fullDist = probs.withIndex().map { (labelMap[it.index] ?: "Unknown") to it.value }
+            val top3 = fullDist.sortedByDescending { it.second }.take(3)
+            
+            var primary_risk_prob = 0f
+            var directive_risk_prob = 0f
+            for (i in probs.indices) {
+                val label = labelMap[i] ?: ""
+                if (PRIMARY_RISK_LABELS.contains(label)) primary_risk_prob += probs[i]
+                if (DIRECTIVE_RISK_LABELS.contains(label)) directive_risk_prob += probs[i]
             }
-            Log.v(TAG, "전체 라벨 분포: $fullDistribution")
 
-            val riskProbability = (probs[0] + probs[4]).coerceIn(0f, 1f)
+            val patterns = detectPatterns(text)
+            val signalCount = patterns.auth + patterns.money + patterns.app_link + patterns.authority + patterns.urgency
+            val hasCoreSignal = patterns.auth == 1 || patterns.money == 1 || patterns.app_link == 1 || patterns.authority == 1
 
-            val maxIdx = logits.indices.maxByOrNull { logits[it] } ?: 22
-            val resultLabel = labelMap[maxIdx] ?: "알 수 없음"
+            val isFraud = primary_risk_prob >= 0.45f || (directive_risk_prob >= 0.65f && hasCoreSignal) || signalCount >= 2
 
-            Log.d(TAG, "--- [분석 결과] ---")
-            Log.d(TAG, "입력 문장: '$safeText'")
-            Log.d(TAG, "의도 분류 결과: $resultLabel (${String.format("%.1f", probs[maxIdx] * 100)}%)")
-            Log.d(TAG, "보이스피싱 위험도(0+4): ${String.format(Locale.US, "%.2f", riskProbability * 100)}%")
+            Log.d(TAG, "==========================================")
+            Log.d(TAG, "[분석 텍스트]: $text")
+            Log.d(TAG, "[Top 3 결과]: ${top3.joinToString { "${it.first}(${String.format(Locale.US, "%.1f", it.second * 100)}%)" }}")
+            Log.d(TAG, "[위험 지표]: Primary: ${String.format(Locale.US, "%.2f", primary_risk_prob)}, Directive: ${String.format(Locale.US, "%.2f", directive_risk_prob)}, Pattern Signals: $signalCount")
+            Log.d(TAG, "[최종 판단]: ${if (isFraud) "🚨 보이스피싱 의심" else "✅ 정상"}")
+            Log.d(TAG, "==========================================")
 
-            return AnalysisResult(riskProbability, resultLabel)
+            return DetailedAnalysisResult(
+                text = text,
+                fullDistribution = fullDist,
+                top3 = top3,
+                primaryRiskProb = primary_risk_prob,
+                directiveRiskProb = directive_risk_prob,
+                signalCount = signalCount,
+                patterns = mapOf(
+                    "인증/정보" to patterns.auth,
+                    "금전/이체" to patterns.money,
+                    "앱/링크" to patterns.app_link,
+                    "기관/수사" to patterns.authority,
+                    "긴박/독촉" to patterns.urgency
+                ),
+                finalDecision = isFraud
+            )
         } catch (e: Exception) {
-            Log.e(TAG, "추론 에러: ${e.message}")
-            return null
+            Log.e(TAG, "추론 실패: ${e.message}")
+            null
         }
+    }
+
+    suspend fun classifyText(text: String): AnalysisResult? {
+        val result = classifyDetailed(text) ?: return null
+        return AnalysisResult(result.finalDecision, result.top3[0].first, result.top3[0].second)
+    }
+
+    private fun softmax(logits: FloatArray): FloatArray {
+        val maxLogit = logits.maxOrNull() ?: 0f
+        val exps = logits.map { exp((it - maxLogit).toDouble()) }
+        val sumExps = exps.sum()
+        return exps.map { (it / sumExps).toFloat() }.toFloatArray()
+    }
+
+    private data class BasePatterns(val auth: Int, val money: Int, val app_link: Int, val authority: Int, val urgency: Int)
+    private fun detectPatterns(text: String): BasePatterns {
+        return BasePatterns(
+            auth = if (text.contains(Regex("인증번호|OTP|보안키|계좌 비밀번호|주민등록|주민번호|신분증|본인 확인|개인 정보"))) 1 else 0,
+            money = if (text.contains(Regex("이체|송금|입금|현금|인출|잔액|전 재산|안전 계좌|예치|계좌|금액|결제"))) 1 else 0,
+            app_link = if (text.contains(Regex("앱|설치|링크|클릭|URL|주소"))) 1 else 0,
+            authority = if (text.contains(Regex("검찰|경찰|금융감독원|금감원|수사|피의자|공범|범죄|조사|법적 절차"))) 1 else 0,
+            urgency = if (text.contains(Regex("지금|즉시|바로|급하|오늘|절대|전화 끊지|조용한 곳|주변에 사람"))) 1 else 0
+        )
     }
 
     fun close() {

@@ -1,6 +1,5 @@
 package com.example.detectcha
 
-import android.Manifest
 import android.accessibilityservice.AccessibilityService
 import android.annotation.SuppressLint
 import android.app.Notification
@@ -9,20 +8,22 @@ import android.app.NotificationManager
 import android.app.usage.UsageEvents
 import android.app.usage.UsageStatsManager
 import android.content.Context
+import android.content.Intent
+import android.content.pm.ServiceInfo
 import android.os.Build
 import android.util.Log
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
-import android.view.accessibility.AccessibilityWindowInfo
+import com.example.detectcha.data.AppDatabase
+import com.example.detectcha.data.PhishingHistory
 import kotlinx.coroutines.*
-import java.util.Locale
 
 @SuppressLint("AccessibilityPolicy")
 class TextCatcherService : AccessibilityService() {
     private val TAG = "TextCatcherService"
     private val NOTIFICATION_ID = 1001
     private val CHANNEL_ID = "DetectchaForegroundChannel"
-    private val WARNING_CHANNEL_ID = "fraud_warning_channel"
+    private val WARNING_CHANNEL_ID = "fraud_warning_channel_v2"
 
     private val serviceScope = CoroutineScope(Dispatchers.Main + SupervisorJob())
     private var pollingJob: Job? = null
@@ -31,7 +32,10 @@ class TextCatcherService : AccessibilityService() {
     private var lastProcessedText: String = ""
 
     private var isFraudSuspected: Boolean = false
+    private var hasWarnedPopup: Boolean = false 
+    
     private var phishingModelManager: PhishingModelManager? = null
+    private lateinit var database: AppDatabase
 
     private val remittanceApps = mapOf(
         "viva.republica.toss" to "토스",
@@ -45,46 +49,55 @@ class TextCatcherService : AccessibilityService() {
         super.onServiceConnected()
         Log.d(TAG, "[Text Catcher Connected]")
         CatcherController.serviceInstance = this
-        createNotificationChannels()
+        
         try {
+            database = AppDatabase.getDatabase(this)
+            createNotificationChannels()
             phishingModelManager = PhishingModelManager(this)
         } catch (e: Exception) {
-            Log.e(TAG, "모델 매니저 초기화 실패: ${e.message}")
+            Log.e(TAG, "Initialization failed: ${e.message}", e)
         }
+        
         updateNotificationState(CatcherController.isCatching)
         startPollingTimer()
     }
 
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        updateNotificationState(CatcherController.isCatching)
+        return START_STICKY
+    }
+
     fun updateNotificationState(isOn: Boolean) {
         try {
-            if (isOn) {
-                val notificationBuilder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                    Notification.Builder(this, CHANNEL_ID)
-                } else {
-                    @Suppress("DEPRECATION")
-                    Notification.Builder(this)
-                }
-
-                val notification = notificationBuilder
-                    .setContentTitle("DETECTCHA")
-                    .setContentText("이 앱은 백그라운드에서 작동 중입니다.")
-                    .setSmallIcon(android.R.drawable.ic_secure)
-                    .setOngoing(true)
-                    .build()
-
-                startForeground(NOTIFICATION_ID, notification)
+            val notification = createForegroundNotification(isOn)
+            
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
             } else {
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-                    stopForeground(STOP_FOREGROUND_REMOVE)
-                } else {
-                    @Suppress("DEPRECATION")
-                    stopForeground(true)
-                }
-                resetState()
+                startForeground(NOTIFICATION_ID, notification)
             }
+
+            if (!isOn) resetState()
         } catch (e: Exception) {
-            Log.e(TAG, "알림 상태 업데이트 실패: ${e.message}")
+            Log.e(TAG, "Notification update failed: ${e.message}", e)
         }
+    }
+
+    private fun createForegroundNotification(isOn: Boolean): Notification {
+        val builder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            Notification.Builder(this, CHANNEL_ID)
+        } else {
+            @Suppress("DEPRECATION")
+            Notification.Builder(this)
+        }
+
+        val msg = if (isOn) "보이스피싱 실시간 탐지 중" else "탐지 서비스 대기 중"
+        return builder
+            .setContentTitle("DETECTCHA")
+            .setContentText(msg)
+            .setSmallIcon(android.R.drawable.ic_secure)
+            .setOngoing(true)
+            .build()
     }
 
     private fun resetState() {
@@ -92,52 +105,62 @@ class TextCatcherService : AccessibilityService() {
         lastProcessedText = ""
         lastWarnedApp = null
         isFraudSuspected = false
+        hasWarnedPopup = false
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         if (!CatcherController.isCatching || event == null) return
 
+        var sourceNode: AccessibilityNodeInfo? = null
         try {
             val packageName = event.packageName?.toString() ?: ""
             if (packageName != "com.google.android.as") return
 
-            if (event.eventType == AccessibilityEvent.TYPE_VIEW_TEXT_CHANGED ||
-                event.eventType == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED) {
-
-                val sourceNode = event.source
-                if (sourceNode != null) {
-                    val fullRawText = aggregateTextFromNode(sourceNode)
-                    sourceNode.recycle()
-
-                    if (fullRawText.isNotBlank()) {
-                        latestRawText = fullRawText
-                    }
-                }
+            sourceNode = event.source ?: return
+            
+            val fullRawText = aggregateTextFromNode(sourceNode)
+            if (fullRawText.isNotBlank()) {
+                latestRawText = fullRawText
             }
         } catch (e: Exception) {
-            Log.e(TAG, "이벤트 처리 중 에러: ${e.message}")
+            Log.e(TAG, "Accessibility event processing error: ${e.message}", e)
+        } finally {
+            sourceNode?.recycle()
         }
     }
 
     private fun aggregateTextFromNode(node: AccessibilityNodeInfo?): String {
         if (node == null) return ""
-        val collectedTexts = mutableListOf<String>()
-        collectTexts(node, collectedTexts)
-        return collectedTexts.distinct().joinToString(" ").trim()
+        val collectedSet = mutableSetOf<String>()
+        val sb = StringBuilder()
+        try {
+            collectTexts(node, collectedSet, sb, 0)
+        } catch (e: Exception) {
+            Log.e(TAG, "Text aggregation error", e)
+        }
+        return sb.toString().trim()
     }
 
-    private fun collectTexts(node: AccessibilityNodeInfo, list: MutableList<String>) {
-        val nodeText = node.text?.toString() ?: node.contentDescription?.toString()
-        if (!nodeText.isNullOrBlank()) {
-            list.add(nodeText.trim())
-        }
+    private fun collectTexts(node: AccessibilityNodeInfo, set: MutableSet<String>, sb: StringBuilder, depth: Int) {
+        if (depth > 25) return
 
-        for (i in 0 until node.childCount) {
-            val child = try { node.getChild(i) } catch (e: Exception) { null }
-            if (child != null) {
-                collectTexts(child, list)
-                try { child.recycle() } catch (e: Exception) {}
+        try {
+            val nodeText = node.text?.toString() ?: node.contentDescription?.toString()
+            if (!nodeText.isNullOrBlank()) {
+                val clean = nodeText.trim()
+                if (set.add(clean)) {
+                    sb.append(clean).append(" ")
+                }
             }
+
+            for (i in 0 until node.childCount) {
+                val child = try { node.getChild(i) } catch (e: Exception) { null }
+                if (child != null) {
+                    collectTexts(child, set, sb, depth + 1)
+                    child.recycle()
+                }
+            }
+        } catch (e: Exception) {
         }
     }
 
@@ -151,7 +174,7 @@ class TextCatcherService : AccessibilityService() {
                         processLatestText()
                     }
                 } catch (e: Exception) {
-                    Log.e(TAG, "폴링 루프 에러: ${e.message}")
+                    Log.e(TAG, "Polling loop error: ${e.message}", e)
                 }
                 delay(2000L)
             }
@@ -162,7 +185,7 @@ class TextCatcherService : AccessibilityService() {
         if (latestRawText.isBlank()) return
 
         try {
-            var currentCleanText = latestRawText.replace(Regex("\\[.*?\\]"), "")
+            val currentCleanText = latestRawText.replace(Regex("\\[.*?\\]"), "")
                 .replace("Live Caption", "")
                 .replace("실시간 자막", "")
                 .replace("\n", " ")
@@ -174,34 +197,34 @@ class TextCatcherService : AccessibilityService() {
             val newText = findNewWords(lastProcessedText, currentCleanText)
 
             if (newText.isNotBlank()) {
-                Log.d(TAG, "[새로 추출된 자막]: $newText")
                 lastProcessedText = currentCleanText
                 analyzePhishing(newText)
             }
         } catch (e: Exception) {
-            Log.e(TAG, "텍스트 처리 에러: ${e.message}")
+            Log.e(TAG, "Text processing error: ${e.message}", e)
         }
     }
 
     private fun findNewWords(old: String, new: String): String {
-        val oldWords = old.split(" ").filter { it.isNotEmpty() }.takeLast(10)
-        val newWords = new.split(" ").filter { it.isNotEmpty() }.takeLast(50)
-        
-        if (oldWords.isEmpty()) return newWords.joinToString(" ")
-        
-        var matchIndexInNew = -1
-        for (i in newWords.indices.reversed()) {
-            val word = newWords[i]
-            if (oldWords.contains(word)) {
-                matchIndexInNew = i
-                break
+        return try {
+            val oldWords = old.split(" ").filter { it.isNotEmpty() }.takeLast(5)
+            val newWords = new.split(" ").filter { it.isNotEmpty() }
+            if (oldWords.isEmpty()) return newWords.joinToString(" ")
+            
+            var matchIndexInNew = -1
+            for (i in newWords.indices.reversed()) {
+                if (oldWords.contains(newWords[i])) {
+                    matchIndexInNew = i
+                    break
+                }
             }
-        }
-        
-        return if (matchIndexInNew != -1) {
-            newWords.subList(matchIndexInNew + 1, newWords.size).joinToString(" ")
-        } else {
-            newWords.joinToString(" ")
+            if (matchIndexInNew != -1) {
+                newWords.subList(matchIndexInNew + 1, newWords.size).joinToString(" ")
+            } else {
+                newWords.takeLast(20).joinToString(" ")
+            }
+        } catch (e: Exception) {
+            new
         }
     }
 
@@ -209,19 +232,59 @@ class TextCatcherService : AccessibilityService() {
         serviceScope.launch(Dispatchers.IO) {
             try {
                 val result = phishingModelManager?.classifyText(text)
-                if (result != null) {
-                    val probability = result.probability
-                    val label = result.label
-                    if (probability >= 0.5f) {
-                        isFraudSuspected = true
-                        Log.e(TAG, "[의심 감지] 유형: $label (${String.format(Locale.US, "%.2f", probability * 100)}%) | 텍스트: $text")
-                    } else {
-                        Log.d(TAG, "[정상 대화] 결과: $label | 텍스트: $text")
+                if (result != null && result.isFraudSuspected) {
+                    isFraudSuspected = true
+                    savePhishingHistory(text, result.topLabel, result.topProbability)
+                    if (!hasWarnedPopup) {
+                        showImmediateWarning()
+                        hasWarnedPopup = true
                     }
                 }
             } catch (e: Exception) {
-                Log.e(TAG, "추론 에러: ${e.message}")
+                Log.e(TAG, "Analysis error: ${e.message}", e)
             }
+        }
+    }
+
+    private fun savePhishingHistory(text: String, label: String, probability: Float) {
+        serviceScope.launch(Dispatchers.IO) {
+            try {
+                val history = PhishingHistory(
+                    text = text,
+                    timestamp = System.currentTimeMillis(),
+                    label = label,
+                    probability = probability
+                )
+                database.phishingHistoryDao().insert(history)
+            } catch (e: Exception) {
+                Log.e(TAG, "History save error: ${e.message}", e)
+            }
+        }
+    }
+
+    private fun showImmediateWarning() {
+        try {
+            val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            val builder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                Notification.Builder(this, WARNING_CHANNEL_ID)
+            } else {
+                @Suppress("DEPRECATION")
+                Notification.Builder(this)
+            }
+
+            val warningNotification = builder
+                .setContentTitle("🚨 보이스피싱 위험 감지")
+                .setContentText("보이스피싱 위험 시나리오가 감지되었습니다.")
+                .setSmallIcon(android.R.drawable.ic_dialog_alert)
+                .setPriority(Notification.PRIORITY_MAX) 
+                .setDefaults(Notification.DEFAULT_ALL)  
+                .setCategory(Notification.CATEGORY_ALARM) 
+                .setAutoCancel(true)
+                .build()
+
+            notificationManager.notify(201, warningNotification)
+        } catch (e: Exception) {
+            Log.e(TAG, "Warning notification error: ${e.message}", e)
         }
     }
 
@@ -250,7 +313,9 @@ class TextCatcherService : AccessibilityService() {
             } else {
                 lastWarnedApp = null
             }
-        } catch (e: Exception) {}
+        } catch (e: Exception) {
+            Log.e(TAG, "Usage stats check error", e)
+        }
     }
 
     private fun sendWarningNotification(packageName: String) {
@@ -265,16 +330,19 @@ class TextCatcherService : AccessibilityService() {
             }
 
             val warningNotification = builder
-                .setContentTitle("⚠보이스피싱 위험 감지")
+                .setContentTitle("⚠ 보이스피싱 위험 감지")
                 .setContentText("통화 중 사기 의심 정황이 발견되었습니다. $appName 송금 시 주의하세요!")
                 .setSmallIcon(android.R.drawable.ic_dialog_alert)
                 .setPriority(Notification.PRIORITY_MAX)
                 .setDefaults(Notification.DEFAULT_ALL)
+                .setCategory(Notification.CATEGORY_ALARM)
                 .setAutoCancel(true)
                 .build()
 
             notificationManager.notify(202, warningNotification)
-        } catch (e: Exception) {}
+        } catch (e: Exception) {
+            Log.e(TAG, "Remittance warning notification error", e)
+        }
     }
 
     private fun createNotificationChannels() {
@@ -282,10 +350,19 @@ class TextCatcherService : AccessibilityService() {
             try {
                 val manager = getSystemService(NotificationManager::class.java)
                 val serviceChannel = NotificationChannel(CHANNEL_ID, "탐지 서비스", NotificationManager.IMPORTANCE_LOW)
-                val warningChannel = NotificationChannel(WARNING_CHANNEL_ID, "보이스피싱 경고 알림", NotificationManager.IMPORTANCE_HIGH)
+                
+                val warningChannel = NotificationChannel(WARNING_CHANNEL_ID, "보이스피싱 경고 알림", NotificationManager.IMPORTANCE_HIGH).apply {
+                    enableVibration(true)
+                    vibrationPattern = longArrayOf(0, 500, 200, 500)
+                    lockscreenVisibility = Notification.VISIBILITY_PUBLIC
+                    description = "보이스피싱 위험 감지 시 상단 팝업 알림을 보냅니다."
+                }
+
                 manager.createNotificationChannel(serviceChannel)
                 manager.createNotificationChannel(warningChannel)
-            } catch (e: Exception) {}
+            } catch (e: Exception) {
+                Log.e(TAG, "Channel creation error", e)
+            }
         }
     }
 
@@ -293,10 +370,14 @@ class TextCatcherService : AccessibilityService() {
 
     override fun onDestroy() {
         super.onDestroy()
-        pollingJob?.cancel()
-        serviceScope.cancel()
-        phishingModelManager?.close()
-        CatcherController.serviceInstance = null
+        try {
+            pollingJob?.cancel()
+            serviceScope.cancel()
+            phishingModelManager?.close()
+            CatcherController.serviceInstance = null
+        } catch (e: Exception) {
+            Log.e(TAG, "Service destroy error", e)
+        }
     }
 }
 
@@ -306,6 +387,10 @@ object CatcherController {
     var isCatching = false
         set (value) {
             field = value
-            serviceInstance?.updateNotificationState(value)
+            try {
+                serviceInstance?.updateNotificationState(value)
+            } catch (e: Exception) {
+                Log.e("CatcherController", "State update failed", e)
+            }
         }
 }

@@ -11,37 +11,51 @@ class NotificationCatcherService : NotificationListenerService() {
     private var lastProcessedText = ""
 
     override fun onListenerConnected() {
-        super.onListenerConnected()
-        Log.d(TAG, "[Notification Listener Connected]")
+        try {
+            super.onListenerConnected()
+            Log.d(TAG, "[Notification Listener Connected]")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed on listener connection: ${e.message}", e)
+        }
     }
 
     override fun onNotificationPosted(sbn: StatusBarNotification?) {
-        if (sbn == null) return
+        try {
+            if (sbn == null) return
 
-        val packageName = sbn.packageName
-        val notification = sbn?.notification ?: return
-        val extras = notification.extras
+            val packageName = sbn.packageName ?: "unknown"
+            val notification = sbn.notification ?: return
+            val extras = notification.extras ?: return
 
-        val isGroupSummary = (notification.flags and android.app.Notification.FLAG_GROUP_SUMMARY) != 0
-        if (isGroupSummary) {
-            return
+            val isGroupSummary = (notification.flags and Notification.FLAG_GROUP_SUMMARY) != 0
+            if (isGroupSummary) return
+
+            if (notification.category == Notification.CATEGORY_TRANSPORT ||
+                notification.category == Notification.CATEGORY_SERVICE) {
+                return
+            }
+
+            val text = extras.getCharSequence(Notification.EXTRA_TEXT)?.toString()
+            if (text.isNullOrBlank()) return
+
+            val title = extras.getCharSequence(Notification.EXTRA_TITLE)?.toString() ?: "No Title"
+
+            val currentMsg = "$title|$text"
+            if (currentMsg == lastProcessedText) return
+            lastProcessedText = currentMsg
+            
+            Log.d(TAG, "[알림] 패키지: $packageName | 타이틀: $title | 내용: $text")
+        } catch (e: Exception) {
+            Log.e(TAG, "Error processing notification: ${e.message}", e)
         }
+    }
 
-
-        if (notification.category == Notification.CATEGORY_TRANSPORT ||
-            notification.category == Notification.CATEGORY_SERVICE) {
-            return
+    override fun onListenerDisconnected() {
+        try {
+            super.onListenerDisconnected()
+            Log.d(TAG, "[Notification Listener Disconnected]")
+        } catch (e: Exception) {
+            Log.e(TAG, "Error on listener disconnection: ${e.message}", e)
         }
-
-        val text = extras.getCharSequence(Notification.EXTRA_TEXT)?.toString()
-        if (text.isNullOrBlank()) return
-
-
-        val title = extras.getString(Notification.EXTRA_TITLE) ?: "No Title"
-
-        val currentMsg = "$title|$text"
-        if (currentMsg == lastProcessedText) return
-        lastProcessedText = currentMsg
-        Log.d("NotificationCatcher", "[알림] 패키지: $packageName | 타이틀: $title | 내용: $text")
     }
 }
