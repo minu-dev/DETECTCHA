@@ -8,8 +8,6 @@ import java.nio.MappedByteBuffer
 import java.nio.channels.FileChannel
 import java.util.Locale
 import kotlin.math.exp
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
 
 class PhishingModelManager(private val context: Context) {
 
@@ -19,11 +17,15 @@ class PhishingModelManager(private val context: Context) {
     private var interpreter: Interpreter? = null
     private lateinit var tokenizer: ElectraTokenizer
     
-    private val mutex = Mutex()
-
-    private var inputIdsIdx = 0
-    private var attentionMaskIdx = 1
+    private var inputIdsIdx = 1
+    private var attentionMaskIdx = 0
     private var tokenTypeIdsIdx = 2
+
+    private val authRegex = Regex("인증번호|OTP|보안키|계좌 비밀번호|주민등록|주민번호|신분증|본인 확인|개인 정보")
+    private val moneyRegex = Regex("이체|송금|입금|현금|인출|잔액|전 재산|안전 계좌|예치|계좌|금액|결제")
+    private val appLinkRegex = Regex("앱|설치|링크|클릭|URL|주소")
+    private val authorityRegex = Regex("검찰|경찰|금융감독원|금감원|수사|피의자|공범|범죄|조사|법적 절차")
+    private val urgencyRegex = Regex("지금|즉시|바로|급하|오늘|절대|전화 끊지|조용한 곳|주변에 사람")
 
     private val labelMap = mapOf(
         0 to "주장", 1 to "제안/요청", 2 to "첫인사", 3 to "확인 질문",
@@ -61,9 +63,11 @@ class PhishingModelManager(private val context: Context) {
     private fun initModel() {
         try {
             val modelBuffer = loadModelFile(context, MODEL_NAME)
-            val options = Interpreter.Options().apply { setNumThreads(4) }
+            val options = Interpreter.Options().apply {
+                setNumThreads(4)
+            }
             val interp = Interpreter(modelBuffer, options)
-            
+
             for (i in 0 until interp.inputTensorCount) {
                 val name = interp.getInputTensor(i).name().lowercase(Locale.ROOT)
                 when {
@@ -72,10 +76,10 @@ class PhishingModelManager(private val context: Context) {
                     name.contains("token_type_ids") -> tokenTypeIdsIdx = i
                 }
             }
-            
+
             interpreter = interp
             tokenizer = ElectraTokenizer(context)
-            Log.d(TAG, "모델 초기화 완료")
+            Log.d(TAG, "모델 초기화 완료 (CPU 모드)")
         } catch (e: Exception) {
             Log.e(TAG, "모델 초기화 실패: ${e.message}")
         }
@@ -90,18 +94,23 @@ class PhishingModelManager(private val context: Context) {
         return fileChannel.map(FileChannel.MapMode.READ_ONLY, startOffset, declaredLength)
     }
 
-    suspend fun classifyDetailed(text: String): DetailedAnalysisResult? = mutex.withLock {
+    // 4월 23일 방식대로 Mutex 없이 일반 함수로 사용하여 레이턴시 최소화
+    fun classifyDetailed(text: String): DetailedAnalysisResult? {
         val interp = interpreter ?: return null
 
-        try {
-            val (inputIds, attentionMask, tokenTypeIds) = tokenizer.tokenize(text)
+        // 실시간 누적 텍스트 부하 방지를 위해 최신 300자만 사용
+        val safeText = if (text.length > 300) text.takeLast(300) else text
 
+        try {
+            val (inputIds, attentionMask, tokenTypeIds) = tokenizer.tokenize(safeText)
+
+            // 여러 입력 노드에 데이터를 병렬로 주입
             val inputs = arrayOfNulls<Any>(3)
             inputs[inputIdsIdx] = arrayOf(inputIds)
             inputs[attentionMaskIdx] = arrayOf(attentionMask)
             inputs[tokenTypeIdsIdx] = arrayOf(tokenTypeIds)
 
-            val outputArray = arrayOf(FloatArray(23)) 
+            val outputArray = arrayOf(FloatArray(23))
             val outputs = mutableMapOf<Int, Any>(0 to outputArray)
 
             interp.runForMultipleInputsOutputs(inputs, outputs)
@@ -110,7 +119,7 @@ class PhishingModelManager(private val context: Context) {
             val probs = softmax(logits)
             val fullDist = probs.withIndex().map { (labelMap[it.index] ?: "Unknown") to it.value }
             val top3 = fullDist.sortedByDescending { it.second }.take(3)
-            
+
             var primary_risk_prob = 0f
             var directive_risk_prob = 0f
             for (i in probs.indices) {
@@ -119,21 +128,19 @@ class PhishingModelManager(private val context: Context) {
                 if (DIRECTIVE_RISK_LABELS.contains(label)) directive_risk_prob += probs[i]
             }
 
-            val patterns = detectPatterns(text)
+            // 시그널 카운트 및 판정 로직
+            val patterns = detectPatterns(safeText)
             val signalCount = patterns.auth + patterns.money + patterns.app_link + patterns.authority + patterns.urgency
-            val hasCoreSignal = patterns.auth == 1 || patterns.money == 1 || patterns.app_link == 1 || patterns.authority == 1
-
-            val isFraud = primary_risk_prob >= 0.45f || (directive_risk_prob >= 0.65f && hasCoreSignal) || signalCount >= 2
+            
+            val isFraud = primary_risk_prob >= 0.45f || (directive_risk_prob >= 0.65f && signalCount >= 1) || signalCount >= 1
 
             Log.d(TAG, "==========================================")
-            Log.d(TAG, "[분석 텍스트]: $text")
-            Log.d(TAG, "[Top 3 결과]: ${top3.joinToString { "${it.first}(${String.format(Locale.US, "%.1f", it.second * 100)}%)" }}")
-            Log.d(TAG, "[위험 지표]: Primary: ${String.format(Locale.US, "%.2f", primary_risk_prob)}, Directive: ${String.format(Locale.US, "%.2f", directive_risk_prob)}, Pattern Signals: $signalCount")
+            Log.d(TAG, "[분석 텍스트]: $safeText")
             Log.d(TAG, "[최종 판단]: ${if (isFraud) "🚨 보이스피싱 의심" else "✅ 정상"}")
             Log.d(TAG, "==========================================")
 
             return DetailedAnalysisResult(
-                text = text,
+                text = safeText,
                 fullDistribution = fullDist,
                 top3 = top3,
                 primaryRiskProb = primary_risk_prob,
@@ -150,11 +157,11 @@ class PhishingModelManager(private val context: Context) {
             )
         } catch (e: Exception) {
             Log.e(TAG, "추론 실패: ${e.message}")
-            null
+            return null
         }
     }
 
-    suspend fun classifyText(text: String): AnalysisResult? {
+    fun classifyText(text: String): AnalysisResult? {
         val result = classifyDetailed(text) ?: return null
         return AnalysisResult(result.finalDecision, result.top3[0].first, result.top3[0].second)
     }
@@ -167,13 +174,14 @@ class PhishingModelManager(private val context: Context) {
     }
 
     private data class BasePatterns(val auth: Int, val money: Int, val app_link: Int, val authority: Int, val urgency: Int)
+
     private fun detectPatterns(text: String): BasePatterns {
         return BasePatterns(
-            auth = if (text.contains(Regex("인증번호|OTP|보안키|계좌 비밀번호|주민등록|주민번호|신분증|본인 확인|개인 정보"))) 1 else 0,
-            money = if (text.contains(Regex("이체|송금|입금|현금|인출|잔액|전 재산|안전 계좌|예치|계좌|금액|결제"))) 1 else 0,
-            app_link = if (text.contains(Regex("앱|설치|링크|클릭|URL|주소"))) 1 else 0,
-            authority = if (text.contains(Regex("검찰|경찰|금융감독원|금감원|수사|피의자|공범|범죄|조사|법적 절차"))) 1 else 0,
-            urgency = if (text.contains(Regex("지금|즉시|바로|급하|오늘|절대|전화 끊지|조용한 곳|주변에 사람"))) 1 else 0
+            auth = if (text.contains(authRegex)) 1 else 0,
+            money = if (text.contains(moneyRegex)) 1 else 0,
+            app_link = if (text.contains(appLinkRegex)) 1 else 0,
+            authority = if (text.contains(authorityRegex)) 1 else 0,
+            urgency = if (text.contains(urgencyRegex)) 1 else 0
         )
     }
 

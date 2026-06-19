@@ -10,7 +10,9 @@ import android.app.usage.UsageStatsManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.media.AudioAttributes
 import android.os.Build
+import android.provider.Settings
 import android.util.Log
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
@@ -23,7 +25,7 @@ class TextCatcherService : AccessibilityService() {
     private val TAG = "TextCatcherService"
     private val NOTIFICATION_ID = 1001
     private val CHANNEL_ID = "DetectchaForegroundChannel"
-    private val WARNING_CHANNEL_ID = "fraud_warning_channel_v2"
+    private val WARNING_CHANNEL_ID = "warning_channel"
 
     private val serviceScope = CoroutineScope(Dispatchers.Main + SupervisorJob())
     private var pollingJob: Job? = null
@@ -31,8 +33,9 @@ class TextCatcherService : AccessibilityService() {
     private var latestRawText: String = ""
     private var lastProcessedText: String = ""
 
+    @Volatile
     private var isFraudSuspected: Boolean = false
-    private var hasWarnedPopup: Boolean = false 
+    private var lastWarnedTime: Long = 0L 
     
     private var phishingModelManager: PhishingModelManager? = null
     private lateinit var database: AppDatabase
@@ -91,7 +94,7 @@ class TextCatcherService : AccessibilityService() {
             Notification.Builder(this)
         }
 
-        val msg = if (isOn) "보이스피싱 실시간 탐지 중" else "탐지 서비스 대기 중"
+        val msg = if (isOn) "보이스피싱 탐지 중" else "탐지 서비스 대기 중"
         return builder
             .setContentTitle("DETECTCHA")
             .setContentText(msg)
@@ -105,7 +108,7 @@ class TextCatcherService : AccessibilityService() {
         lastProcessedText = ""
         lastWarnedApp = null
         isFraudSuspected = false
-        hasWarnedPopup = false
+        lastWarnedTime = 0L
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
@@ -143,7 +146,6 @@ class TextCatcherService : AccessibilityService() {
 
     private fun collectTexts(node: AccessibilityNodeInfo, set: MutableSet<String>, sb: StringBuilder, depth: Int) {
         if (depth > 25) return
-
         try {
             val nodeText = node.text?.toString() ?: node.contentDescription?.toString()
             if (!nodeText.isNullOrBlank()) {
@@ -235,9 +237,11 @@ class TextCatcherService : AccessibilityService() {
                 if (result != null && result.isFraudSuspected) {
                     isFraudSuspected = true
                     savePhishingHistory(text, result.topLabel, result.topProbability)
-                    if (!hasWarnedPopup) {
+                    
+                    val currentTime = System.currentTimeMillis()
+                    if (currentTime - lastWarnedTime >= 4000L) {
                         showImmediateWarning()
-                        hasWarnedPopup = true
+                        lastWarnedTime = currentTime
                     }
                 }
             } catch (e: Exception) {
@@ -265,20 +269,25 @@ class TextCatcherService : AccessibilityService() {
     private fun showImmediateWarning() {
         try {
             val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+
+            val soundUri = android.net.Uri.parse("android.resource://${packageName}/${R.raw.alert_sound}")
+            val vibrationPattern = longArrayOf(0, 600, 200, 600)
+
             val builder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 Notification.Builder(this, WARNING_CHANNEL_ID)
             } else {
                 @Suppress("DEPRECATION")
                 Notification.Builder(this)
+                    .setSound(soundUri)
+                    .setVibrate(vibrationPattern)
             }
 
             val warningNotification = builder
                 .setContentTitle("🚨 보이스피싱 위험 감지")
-                .setContentText("보이스피싱 위험 시나리오가 감지되었습니다.")
+                .setContentText("보이스피싱 의심 상황 감지되었습니다.")
                 .setSmallIcon(android.R.drawable.ic_dialog_alert)
-                .setPriority(Notification.PRIORITY_MAX) 
-                .setDefaults(Notification.DEFAULT_ALL)  
-                .setCategory(Notification.CATEGORY_ALARM) 
+                .setPriority(Notification.PRIORITY_MAX)
+                .setCategory(Notification.CATEGORY_ALARM)
                 .setAutoCancel(true)
                 .build()
 
@@ -349,13 +358,32 @@ class TextCatcherService : AccessibilityService() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             try {
                 val manager = getSystemService(NotificationManager::class.java)
-                val serviceChannel = NotificationChannel(CHANNEL_ID, "탐지 서비스", NotificationManager.IMPORTANCE_LOW)
-                
-                val warningChannel = NotificationChannel(WARNING_CHANNEL_ID, "보이스피싱 경고 알림", NotificationManager.IMPORTANCE_HIGH).apply {
+
+                // 포그라운드 서비스 채널 (기존과 동일)
+                val serviceChannel = NotificationChannel(
+                    CHANNEL_ID,
+                    "탐지 서비스",
+                    NotificationManager.IMPORTANCE_LOW
+                )
+
+                // 경고 채널: 진동과 커스텀 사운드 설정
+                val warningChannel = NotificationChannel(
+                    WARNING_CHANNEL_ID,
+                    "보이스피싱 경고 알림",
+                    NotificationManager.IMPORTANCE_HIGH
+                ).apply {
                     enableVibration(true)
-                    vibrationPattern = longArrayOf(0, 500, 200, 500)
+                    vibrationPattern = longArrayOf(0, 600, 200, 600) // 더 강한 패턴
                     lockscreenVisibility = Notification.VISIBILITY_PUBLIC
-                    description = "보이스피싱 위험 감지 시 상단 팝업 알림을 보냅니다."
+                    description = "보이스피싱 위험 감지 시 상단 팝업 알림과 진동을 보냅니다."
+
+                    // 앱 내 raw 자원 사용: res/raw/alert_sound.ogg
+                    val soundUri = android.net.Uri.parse("android.resource://${packageName}/${R.raw.alert_sound}")
+                    val audioAttributes = AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_ALARM) // 경고성이라 ALARM 사용 권장
+                        .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                        .build()
+                    setSound(soundUri, audioAttributes)
                 }
 
                 manager.createNotificationChannel(serviceChannel)

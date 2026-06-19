@@ -372,9 +372,6 @@ fun HistoryOverlay(onClose: () -> Unit, onOpenTest: () -> Unit, viewModel: Phish
             Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
                 Text(text = "피싱 탐지 내역", color = Color.White, fontSize = 20.sp, fontWeight = FontWeight.Bold)
                 Row {
-                    IconButton(onClick = onOpenTest) { 
-                        Icon(Icons.Default.Search, contentDescription = "Test", tint = Color.Cyan)
-                    }
                     IconButton(onClick = { 
                         try {
                             viewModel.clearAll() 
