@@ -49,7 +49,7 @@
 
 ## 🏗️ Architecture
 
-![Architecture](img/Architectures.png)
+<img src="img/Architectures.png" width="40%">
 
 ---
 
