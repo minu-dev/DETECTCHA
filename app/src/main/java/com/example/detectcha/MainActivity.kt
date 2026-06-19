@@ -58,6 +58,7 @@ import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.ExoPlayer
 import com.example.detectcha.data.PhishingHistory
+import com.example.detectcha.ui.OnboardingScreen
 import com.example.detectcha.ui.PhishingHistoryViewModel
 import com.example.detectcha.ui.PhishingTestScreen
 import java.text.SimpleDateFormat
@@ -81,16 +82,29 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         
         setupGlobalExceptionHandler()
-        
-        try {
-            startPermissionCheckFlow()
-        } catch (e: Exception) {
-            Log.e(TAG, "Initial permission flow failed", e)
+
+        // 온보딩을 이미 완료한 사용자만 즉시 권한 흐름을 시작한다.
+        // 최초 실행 사용자는 온보딩에서 권한의 목적을 안내한 뒤(완료 콜백) 권한을 요청한다.
+        if (!OnboardingManager.isFirstLaunch(this)) {
+            try {
+                startPermissionCheckFlow()
+            } catch (e: Exception) {
+                Log.e(TAG, "Initial permission flow failed", e)
+            }
         }
 
         setContent {
             val windowSizeClass = calculateWindowSizeClass(this)
-            DetectchaApp(windowSizeClass)
+            DetectchaApp(
+                windowSizeClass = windowSizeClass,
+                onRequestPermissions = {
+                    try {
+                        startPermissionCheckFlow()
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Permission flow after onboarding failed", e)
+                    }
+                }
+            )
         }
     }
 
@@ -138,6 +152,7 @@ class MainActivity : ComponentActivity() {
 @Composable
 fun DetectchaApp(
     windowSizeClass: WindowSizeClass,
+    onRequestPermissions: () -> Unit = {},
     viewModel: PhishingHistoryViewModel = viewModel()
 ) {
     val backgroundPainter = painterResource(id = R.drawable.background_image)
@@ -150,6 +165,7 @@ fun DetectchaApp(
     var isTestScreenOpen by remember { mutableStateOf(false) }
 
     val context = LocalContext.current
+    var showOnboarding by remember { mutableStateOf(OnboardingManager.isFirstLaunch(context)) }
     val videoResId = R.raw.arc_reactor
 
     val exoPlayer = remember {
@@ -355,6 +371,21 @@ fun DetectchaApp(
             exit = slideOutHorizontally(targetOffsetX = { it }) + fadeOut()
         ) {
             PhishingTestScreen(onBack = { isTestScreenOpen = false })
+        }
+
+        // 최초 실행 온보딩(튜토리얼) — 모든 UI 위에 표시되며, 완료 시 권한 흐름을 시작한다.
+        AnimatedVisibility(
+            visible = showOnboarding,
+            enter = fadeIn(),
+            exit = fadeOut()
+        ) {
+            OnboardingScreen(
+                onFinish = {
+                    OnboardingManager.setCompleted(context)
+                    showOnboarding = false
+                    onRequestPermissions()
+                }
+            )
         }
     }
 }
